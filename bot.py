@@ -1,11 +1,11 @@
 import os
 import logging
 import re
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import instaloader
+import subprocess
 import asyncio
 from pathlib import Path
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -16,27 +16,12 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-loader = instaloader.Instaloader(
-    download_videos=True,
-    download_video_thumbnails=False,
-    download_geotags=False,
-    download_comments=False,
-    save_metadata=False,
-    compress_json=False,
-    post_metadata_txt_pattern=''
-)
-
-def extract_shortcode(url: str) -> str:
+def is_instagram_url(url: str) -> bool:
     patterns = [
-        r'instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)',
-        r'instagram\.com/reels?/([A-Za-z0-9_-]+)',
+        r'instagram\.com/(?:p|reel|tv)/[A-Za-z0-9_-]+',
+        r'instagram\.com/reels?/[A-Za-z0-9_-]+',
     ]
-
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
+    return any(re.search(pattern, url) for pattern in patterns)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -56,64 +41,84 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    shortcode = extract_shortcode(message_text)
-
-    if not shortcode:
+    if not is_instagram_url(message_text):
         await update.message.reply_text("❌ Noto'g'ri Instagram link. Iltimos, to'g'ri link yuboring.")
         return
 
     status_msg = await update.message.reply_text("⏳ Video yuklab olinmoqda...")
 
+    import time
+    import shutil
+
+    temp_dir = DOWNLOAD_DIR / f"temp_{int(time.time())}"
+    temp_dir.mkdir(exist_ok=True)
+
     try:
-        post = instaloader.Post.from_shortcode(loader.context, shortcode)
+        # yt-dlp orqali video yuklab olish
+        output_template = str(temp_dir / "video.%(ext)s")
 
-        if not post.is_video:
-            await status_msg.edit_text("❌ Bu post video emas. Faqat videolarni yuklab olishim mumkin.")
-            return
+        cmd = [
+            "yt-dlp",
+            "--no-warnings",
+            "--no-check-certificate",
+            "-f", "best",
+            "-o", output_template,
+            message_text.strip()
+        ]
 
-        video_path = None
-
-        await asyncio.to_thread(
-            loader.download_post,
-            post,
-            target=str(DOWNLOAD_DIR / shortcode)
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
 
-        for file in DOWNLOAD_DIR.glob(f"{shortcode}/*.mp4"):
-            video_path = file
-            break
+        stdout, stderr = await process.communicate()
 
-        if not video_path or not video_path.exists():
+        if process.returncode != 0:
+            error_msg = stderr.decode('utf-8', errors='ignore')
+            logger.error(f"yt-dlp error: {error_msg}")
+            await status_msg.edit_text(
+                "❌ Video yuklab olishda xatolik yuz berdi.\n"
+                "Bu post private yoki o'chirilgan bo'lishi mumkin."
+            )
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+
+        # Yuklab olingan videoni topish
+        video_files = list(temp_dir.glob("video.*"))
+
+        if not video_files:
             await status_msg.edit_text("❌ Video topilmadi.")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+
+        video_path = video_files[0]
+        file_size = video_path.stat().st_size
+
+        # Telegram fayl hajmi limiti: 50MB
+        if file_size > 50 * 1024 * 1024:
+            await status_msg.edit_text("❌ Video juda katta (50MB dan oshiq). Kichikroq video yuboring.")
+            shutil.rmtree(temp_dir, ignore_errors=True)
             return
 
         await status_msg.edit_text("📤 Video yuborilmoqda...")
 
-        caption = f"📹 Instagram Video\n"
-        if post.caption:
-            caption += f"\n{post.caption[:200]}{'...' if len(post.caption) > 200 else ''}"
-
         with open(video_path, 'rb') as video_file:
             await update.message.reply_video(
                 video=video_file,
-                caption=caption,
-                supports_streaming=True
+                caption="📹 Instagram Video",
+                supports_streaming=True,
+                read_timeout=60,
+                write_timeout=60
             )
 
         await status_msg.delete()
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
-        import shutil
-        shutil.rmtree(DOWNLOAD_DIR / shortcode, ignore_errors=True)
-
-    except instaloader.exceptions.InstaloaderException as e:
-        logger.error(f"Instaloader error: {e}")
-        await status_msg.edit_text(
-            "❌ Video yuklab olishda xatolik yuz berdi.\n"
-            "Bu post private yoki o'chirilgan bo'lishi mumkin."
-        )
     except Exception as e:
         logger.error(f"Error: {e}")
         await status_msg.edit_text("❌ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
